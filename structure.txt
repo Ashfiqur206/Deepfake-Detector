@@ -1,0 +1,17 @@
+deepfake-sentinel/
+├── venv/                     # Virtual environment (created automatically)
+├── app.py                    # Main Streamlit application
+├── requirements.txt          # All dependencies
+├── setup_env.py              # Environment setup script
+├── models/
+│   ├── __init__.py
+│   ├── image_detector.py
+│   ├── video_detector.py
+│   ├── audio_detector.py
+│   └── utils.py
+├── static/
+│   └── style.css
+├── tests/
+│   └── test_detectors.py
+├── .env                      # Environment variables
+└── README.md
