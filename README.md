@@ -22,7 +22,7 @@ DeepFake Sentinel is an AI-powered tool that helps people detect synthetic media
 
 ```bash
 git clone https://github.com/Ashfiqur206/Deepfake-Detector.git
-cd deepfake-sentinel
+cd Deepfake-Detector
 python -m venv venv1
 source venv1/bin/activate
 pip install -r requirements.txt
