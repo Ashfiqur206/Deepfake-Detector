@@ -111,9 +111,6 @@ def load_css():
             border-radius: 8px;
             margin: 1rem 0;
         }
-        .stImage {
-            max-width: 100%;
-        }
     </style>
     """, unsafe_allow_html=True)
 
@@ -122,8 +119,6 @@ if 'detection_history' not in st.session_state:
     st.session_state.detection_history = []
 if 'model_loaded' not in st.session_state:
     st.session_state.model_loaded = False
-if 'upload_progress' not in st.session_state:
-    st.session_state.upload_progress = 0
 
 
 @st.cache_resource
@@ -458,13 +453,34 @@ def main():
 
                     elif file_extension in ['mp4', 'avi', 'mov', 'mkv']:
                         st.markdown("### 🎥 Video Analysis")
-                        with st.spinner("Extracting and analyzing video frames..."):
-                            result = video_detector.detect(temp_path)
-                            result['processing_time'] = time.time() - start_time
+
+                        # Check FFmpeg availability
+                        import subprocess
+                        try:
+                            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+                        except:
+                            st.warning("""
+                            ⚠️ FFmpeg not found. Video analysis may not work properly.
+
+                            Please install FFmpeg:
+                            - Windows: Download from https://ffmpeg.org/download.html
+                            - macOS: `brew install ffmpeg`
+                            - Linux: `sudo apt-get install ffmpeg`
+                            """)
+
+                        result = video_detector.detect(temp_path)
+                        result['processing_time'] = time.time() - start_time
                         if result['success']:
                             display_video_result(result, uploaded_file)
                         else:
                             st.error(f"Video analysis failed: {result.get('error', 'Unknown error')}")
+                            st.info("""
+                            💡 Troubleshooting:
+                            1. Make sure FFmpeg is installed
+                            2. Check if the video file is corrupted
+                            3. Try a different video format (MP4 is recommended)
+                            4. Ensure the video is not too long (max 30 frames analyzed)
+                            """)
 
                     elif file_extension in ['mp3', 'wav', 'm4a']:
                         st.markdown("### 🔊 Audio Analysis")
@@ -532,16 +548,6 @@ def main():
                 <p style="font-size: 0.8rem; color: #6c757d;">Max: 1GB</p>
             </div>
             """, unsafe_allow_html=True)
-
-        st.markdown("---")
-        st.markdown("""
-        ### 💡 Tips for Large Files
-
-        - **Videos**: Large videos will take longer to process. The system analyzes frames at intervals for efficiency.
-        - **Images**: High-resolution images are resized for analysis while maintaining quality.
-        - **Audio**: Long audio files are analyzed for patterns and characteristics.
-        - **Performance**: Processing time depends on file size and complexity.
-        """)
 
 
 if __name__ == "__main__":
