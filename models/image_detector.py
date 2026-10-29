@@ -1,142 +1,114 @@
 import numpy as np
 from PIL import Image
 import logging
-import random
-from mtcnn import MTCNN
+import torch
+from transformers import ViTForImageClassification, ViTImageProcessor
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class ImageDetector:
+    FAKE_THRESHOLD = 0.60
+    REAL_THRESHOLD = 0.40
+    MODEL_NAME = "buildborderless/CommunityForensics-DeepfakeDet-ViT"
 
     def __init__(self):
-        try:
-            self.face_detector = MTCNN()
-            logger.info("Face detector initialized")
-        except Exception as e:
-            logger.warning(f"Could not initialize MTCNN: {e}")
-            self.face_detector = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.processor = ViTImageProcessor.from_pretrained(self.MODEL_NAME)
+        self.model = ViTForImageClassification.from_pretrained(self.MODEL_NAME)
+        self.model.to(self.device).eval()
+        # id2label: {"0": "real", "1": "fake"}
+        self.fake_index = self._find_fake_index()
 
-        logger.info("ImageDetector initialized")
-
-    def preprocess_image(self, image_path):
-        try:
-            image = Image.open(image_path)
-            image_rgb = np.array(image.convert('RGB'))
-
-            if self.face_detector is None:
-                return None, None, None, "Face detector not available"
-
-            faces = self.face_detector.detect_faces(image_rgb)
-
-            if not faces:
-                return None, None, None, "No face detected in the image"
-
-            largest_face = max(faces, key=lambda x: x['box'][2] * x['box'][3])
-            x, y, w, h = largest_face['box']
-
-            x = max(0, x)
-            y = max(0, y)
-            w = min(w, image_rgb.shape[1] - x)
-            h = min(h, image_rgb.shape[0] - y)
-
-            if w <= 0 or h <= 0:
-                return None, None, None, "Invalid face region"
-
-            face = image_rgb[y:y + h, x:x + w]
-
-            return face, (x, y, w, h), face, "Success"
-
-        except Exception as e:
-            logger.error(f"Preprocessing error: {e}")
-            return None, None, None, str(e)
+    def _find_fake_index(self):
+        id2label = self.model.config.id2label
+        for idx, label in id2label.items():
+            if label.lower() == "fake":
+                return int(idx)
+        return 1  # fallback
 
     def detect(self, image_path):
         try:
-            face, bbox, face_crop, status = self.preprocess_image(image_path)
+            img = Image.open(image_path).convert("RGB")
+            inputs = self.processor(images=img, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-            if face is None:
-                return {
-                    'success': False,
-                    'error': status,
-                    'verdict': 'UNKNOWN',
-                    'confidence': 0.5,
-                    'explanation': 'No face detected. This tool focuses on facial manipulation.',
-                    'heatmap': None
-                }
+            with torch.no_grad():
+                logits = self.model(**inputs).logits
+                probs = torch.softmax(logits, dim=-1)[0]
 
-            confidence = random.uniform(0.1, 0.9)
-
-            threshold = 0.5
-            if confidence < threshold:
-                verdict = 'REAL'
-                explanation = "The image appears to be authentic with no significant signs of manipulation."
-            else:
-                verdict = 'FAKE'
-                if confidence < 0.7:
-                    explanation = "The model detected potential manipulation with moderate confidence."
-                else:
-                    explanation = "The model strongly detected signs of manipulation. Common indicators include unnatural textures or inconsistent lighting."
-
-            heatmap = self._generate_heatmap(face)
+            fake_prob = float(probs[self.fake_index])
+            confidence, band = self._calibrate(fake_prob)
+            verdict = self._verdict(confidence)
 
             return {
-                'success': True,
-                'verdict': verdict,
-                'confidence': confidence,
-                'explanation': explanation,
-                'heatmap': heatmap,
-                'model': 'Face Detection + Feature Analysis',
-                'face_bbox': bbox,
-                'processing_time': 0.0
+                "success": True,
+                "verdict": verdict,
+                "confidence": confidence,
+                "confidence_band": band,
+                "explanation": self._explain(verdict, confidence, fake_prob),
+                "signals": [
+                    {
+                        "name": "CommunityForensics ViT",
+                        "value": fake_prob,
+                        "weight": 1.0,
+                        "note": f"HF model output (fake prob = {fake_prob:.3f})",
+                    }
+                ],
+                "heatmap": None,  # HF ViT does not provide Grad-CAM out of the box
+                "model": "CommunityForensics-DeepfakeDet-ViT",
+                "ensemble_method": "single-model",
+                "detectors_voted": 1,
+                "threshold": f"{self.REAL_THRESHOLD:.2f} / {self.FAKE_THRESHOLD:.2f}",
             }
-
         except Exception as e:
-            logger.error(f"Detection error: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e),
-                'verdict': 'ERROR',
-                'confidence': 0.5,
-                'explanation': f"An error occurred during analysis: {str(e)}",
-                'heatmap': None
-            }
+            logger.error(f"Image detect error: {e}", exc_info=True)
+            return self._error_result(str(e))
 
-    def _generate_heatmap(self, face):
-        try:
-            h, w = face.shape[:2]
+    def _calibrate(self, raw_prob):
+        # The model outputs a raw probability. Map to a calibrated confidence
+        # that preserves the UNKNOWN band for borderline cases.
+        # We keep raw_prob as-is but clip slightly to avoid 0/1 extremes.
+        confidence = float(np.clip(raw_prob, 0.02, 0.98))
+        return confidence, self._band(confidence)
 
-            heatmap = np.zeros((h, w), dtype=np.float32)
+    @staticmethod
+    def _band(c):
+        if c < 0.20: return "very_low"
+        if c < 0.40: return "low"
+        if c < 0.60: return "medium"
+        if c < 0.80: return "high"
+        return "very_high"
 
-            center_y, center_x = h // 2, w // 2
+    def _verdict(self, c):
+        if c >= self.FAKE_THRESHOLD: return "FAKE"
+        if c <= self.REAL_THRESHOLD: return "REAL"
+        return "UNKNOWN"
 
-            for i in range(h):
-                for j in range(w):
-                    dist = np.sqrt(((i - center_y) / h) ** 2 + ((j - center_x) / w) ** 2)
-                    heatmap[i, j] = max(0, 1 - dist * 2.5) + random.uniform(0, 0.05)
+    def _explain(self, verdict, confidence, raw):
+        if verdict == "FAKE":
+            return (
+                f"The CommunityForensics ViT flagged this image as likely synthetic "
+                f"(raw fake probability {raw:.0%}). This model was trained on 2.7M images "
+                f"across 4,803 generators and has a reported accuracy of 97.2%."
+            )
+        if verdict == "REAL":
+            return (
+                f"The model found no strong evidence of manipulation "
+                f"(raw fake probability {raw:.0%}). The image is consistent with authentic content."
+            )
+        return (
+            f"The model is uncertain (raw fake probability {raw:.0%}). "
+            f"This often happens with heavy compression, unusual lighting, or images "
+            f"from generators not seen during training. Try a clearer image."
+        )
 
-            heatmap = np.clip(heatmap, 0, 1)
-
-            heatmap_colored = np.zeros((h, w, 3), dtype=np.uint8)
-
-            for i in range(h):
-                for j in range(w):
-                    val = int(heatmap[i, j] * 255)
-                    if val < 85:
-                        heatmap_colored[i, j] = [val * 3, 255 - val * 3, 0]
-                    elif val < 170:
-                        val2 = val - 85
-                        heatmap_colored[i, j] = [255, val2 * 3, 0]
-                    else:
-                        val2 = val - 170
-                        heatmap_colored[i, j] = [255 - val2 * 3, 255, 0]
-
-            face_uint8 = np.clip(face, 0, 255).astype(np.uint8)
-            overlay = (face_uint8 * 0.6 + heatmap_colored * 0.4).astype(np.uint8)
-
-            return overlay
-
-        except Exception as e:
-            logger.error(f"Heatmap generation error: {e}")
-            return None
+    def _error_result(self, msg):
+        return {
+            "success": False,
+            "error": msg,
+            "verdict": "ERROR",
+            "confidence": 0.5,
+            "explanation": f"Analysis failed: {msg}",
+            "signals": [],
+        }
