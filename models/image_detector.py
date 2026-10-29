@@ -2,7 +2,7 @@ import numpy as np
 from PIL import Image
 import logging
 import torch
-from transformers import ViTForImageClassification, ViTImageProcessor
+from transformers import AutoImageProcessor, SiglipForImageClassification
 
 logger = logging.getLogger(__name__)
 
@@ -10,22 +10,20 @@ logger = logging.getLogger(__name__)
 class ImageDetector:
     FAKE_THRESHOLD = 0.60
     REAL_THRESHOLD = 0.40
-    MODEL_NAME = "buildborderless/CommunityForensics-DeepfakeDet-ViT"
+    MODEL_NAME = "prithivMLmods/deepfake-detector-model-v1"
 
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.processor = ViTImageProcessor.from_pretrained(self.MODEL_NAME)
-        self.model = ViTForImageClassification.from_pretrained(self.MODEL_NAME)
+        self.processor = AutoImageProcessor.from_pretrained(self.MODEL_NAME)
+        self.model = SiglipForImageClassification.from_pretrained(self.MODEL_NAME)
         self.model.to(self.device).eval()
-        # id2label: {"0": "real", "1": "fake"}
-        self.fake_index = self._find_fake_index()
 
-    def _find_fake_index(self):
-        id2label = self.model.config.id2label
-        for idx, label in id2label.items():
-            if label.lower() == "fake":
-                return int(idx)
-        return 1  # fallback
+        cfg = self.model.config
+        self.fake_index = 0
+        for idx, label in (cfg.id2label or {}).items():
+            if str(label).lower() in ("fake", "deepfake", "synthetic", "ai", "manipulated"):
+                self.fake_index = int(idx)
+                break
 
     def detect(self, image_path):
         try:
@@ -35,9 +33,8 @@ class ImageDetector:
 
             with torch.no_grad():
                 logits = self.model(**inputs).logits
-                probs = torch.softmax(logits, dim=-1)[0]
 
-            fake_prob = float(probs[self.fake_index])
+            fake_prob = self._extract_fake_prob(logits)
             confidence, band = self._calibrate(fake_prob)
             verdict = self._verdict(confidence)
 
@@ -49,14 +46,14 @@ class ImageDetector:
                 "explanation": self._explain(verdict, confidence, fake_prob),
                 "signals": [
                     {
-                        "name": "CommunityForensics ViT",
+                        "name": "SigLIP Deepfake Detector",
                         "value": fake_prob,
                         "weight": 1.0,
-                        "note": f"HF model output (fake prob = {fake_prob:.3f})",
+                        "note": f"fake prob = {fake_prob:.3f}",
                     }
                 ],
-                "heatmap": None,  # HF ViT does not provide Grad-CAM out of the box
-                "model": "CommunityForensics-DeepfakeDet-ViT",
+                "heatmap": None,
+                "model": self.MODEL_NAME,
                 "ensemble_method": "single-model",
                 "detectors_voted": 1,
                 "threshold": f"{self.REAL_THRESHOLD:.2f} / {self.FAKE_THRESHOLD:.2f}",
@@ -65,42 +62,65 @@ class ImageDetector:
             logger.error(f"Image detect error: {e}", exc_info=True)
             return self._error_result(str(e))
 
+    def _extract_fake_prob(self, logits):
+        if hasattr(logits, "logits"):
+            logits = logits.logits
+        if isinstance(logits, (list, tuple)):
+            logits = torch.tensor(logits)
+        if not isinstance(logits, torch.Tensor):
+            return 0.5
+
+        flat = logits.detach().flatten()
+
+        if flat.numel() == 0:
+            return 0.5
+        if flat.numel() == 1:
+            return float(torch.sigmoid(flat[0]).item())
+
+        probs = torch.softmax(flat, dim=0)
+        idx = self.fake_index
+        if idx >= probs.numel() or idx < 0:
+            idx = 0
+
+        return float(probs[idx].item())
+
     def _calibrate(self, raw_prob):
-        # The model outputs a raw probability. Map to a calibrated confidence
-        # that preserves the UNKNOWN band for borderline cases.
-        # We keep raw_prob as-is but clip slightly to avoid 0/1 extremes.
         confidence = float(np.clip(raw_prob, 0.02, 0.98))
         return confidence, self._band(confidence)
 
     @staticmethod
     def _band(c):
-        if c < 0.20: return "very_low"
-        if c < 0.40: return "low"
-        if c < 0.60: return "medium"
-        if c < 0.80: return "high"
+        if c < 0.20:
+            return "very_low"
+        if c < 0.40:
+            return "low"
+        if c < 0.60:
+            return "medium"
+        if c < 0.80:
+            return "high"
         return "very_high"
 
     def _verdict(self, c):
-        if c >= self.FAKE_THRESHOLD: return "FAKE"
-        if c <= self.REAL_THRESHOLD: return "REAL"
+        if c >= self.FAKE_THRESHOLD:
+            return "FAKE"
+        if c <= self.REAL_THRESHOLD:
+            return "REAL"
         return "UNKNOWN"
 
     def _explain(self, verdict, confidence, raw):
         if verdict == "FAKE":
             return (
-                f"The CommunityForensics ViT flagged this image as likely synthetic "
-                f"(raw fake probability {raw:.0%}). This model was trained on 2.7M images "
-                f"across 4,803 generators and has a reported accuracy of 97.2%."
+                f"The SigLIP model flagged this image as likely synthetic "
+                f"(fake probability {raw:.0%}). Reported accuracy: ~94%."
             )
         if verdict == "REAL":
             return (
-                f"The model found no strong evidence of manipulation "
-                f"(raw fake probability {raw:.0%}). The image is consistent with authentic content."
+                f"No strong evidence of manipulation found "
+                f"(fake probability {raw:.0%})."
             )
         return (
-            f"The model is uncertain (raw fake probability {raw:.0%}). "
-            f"This often happens with heavy compression, unusual lighting, or images "
-            f"from generators not seen during training. Try a clearer image."
+            f"The model is uncertain (fake probability {raw:.0%}). "
+            f"Try a clearer image for a more decisive result."
         )
 
     def _error_result(self, msg):
